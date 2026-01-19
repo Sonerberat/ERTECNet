@@ -631,28 +631,6 @@ class ESNRidgeSolver:
 # Dataset Loader
 # -----------------------------
 
-class PCAMHFDataset(torch.utils.data.Dataset):
-    """
-    Lightweight wrapper to feed HF PCam splits into a PyTorch DataLoader.
-    """
-    def __init__(self, ds, img_col, label_col, transform=None, class_names=None):
-        self.ds = ds
-        self.img_col = img_col
-        self.label_col = label_col
-        self.transform = transform
-        self.classes = class_names or ["normal", "metastasis"]
-
-    def __len__(self):
-        return len(self.ds)
-
-    def __getitem__(self, idx):
-        ex = self.ds[idx]
-        img = ex[self.img_col]
-        if self.transform:
-            img = self.transform(img)
-        return img, int(ex[self.label_col])
-
-
 def make_dataloaders(dataset, image_size, batch_size, num_workers,
                      root="./data", dataset_root=None, prefetch_factor=2):
     H, W = image_size
@@ -689,13 +667,12 @@ def make_dataloaders(dataset, image_size, batch_size, num_workers,
 
     elif dataset == "pcam":
         try:
-            from datasets import load_dataset, concatenate_datasets
-        except ImportError as e:
-            raise RuntimeError("The 'pcam' dataset requires the 'datasets' library. Please install it with 'pip install datasets'.") from e
-
-        #
-        hf_root = os.path.join(data_root, "pcam_hf")
-        ds = load_dataset("1aurent/PatchCamelyon", cache_dir=hf_root)
+            from torchvision.datasets import PCAM
+        except Exception as e:
+            raise RuntimeError(
+                "The 'pcam' dataset requires torchvision with PCAM support and h5py. "
+                "Please install/upgrade torchvision and h5py."
+            ) from e
 
         train_tfm = transforms.Compose([
             transforms.Resize((H, W)),
@@ -703,40 +680,25 @@ def make_dataloaders(dataset, image_size, batch_size, num_workers,
             transforms.RandomVerticalFlip(),
             transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.02),
             transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            transforms.Normalize(mean=(0.700756, 0.538358, 0.691621), std=(0.234978, 0.277409, 0.212895)),
         ])
         test_tfm = transforms.Compose([
             transforms.Resize((H, W)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            transforms.Normalize(mean=(0.700756, 0.538358, 0.691621), std=(0.234978, 0.277409, 0.212895)),
         ])
 
-        # Combine train and validation for training
-        train_splits = []
-        for key in ("train", "validation"):
-            if key in ds:
-                train_splits.append(ds[key])
-        if not train_splits:
-             train_splits.append(next(iter(ds.values())))
-        
-        train_split = concatenate_datasets(train_splits)
+        try:
+            train_ds = PCAM(root=data_root, split="train", transform=train_tfm, download=True)
+            test_ds = PCAM(root=data_root, split="test", transform=test_tfm, download=True)
+        except Exception as exc:
+            raise RuntimeError("Failed to load PCAM dataset.") from exc
 
-        # Use explicit test set if available
-        if "test" in ds:
-            test_split = ds["test"]
-        else:
-            # Fallback if 'test' is missing 
-            print("[warn] 'test' split not found in PCam dataset. Splitting 20% from training set.")
-            split_result = train_split.train_test_split(test_size=0.2, seed=42, shuffle=True)
-            train_split, test_split = split_result["train"], split_result["test"]
+        class_names = getattr(train_ds, "classes", None) or ["normal", "metastasis"]
+        train_ds.classes = class_names
+        test_ds.classes = class_names
 
-        train_ds = PCAMHFDataset(train_split, "image", "label", train_tfm)
-        test_ds = PCAMHFDataset(test_split, "image", "label", test_tfm)
-
-        if hasattr(train_ds.ds.features.get("label"), "names"):
-            train_ds.classes = test_ds.classes = train_ds.ds.features["label"].names
-
-        in_ch, num_classes = 3, len(train_ds.classes)
+        in_ch, num_classes = 3, len(class_names)
 
     elif dataset == "random_uniklinikum":
         data_dir = dataset_root or os.environ.get("RANDOM_UNIKLINIKUM_DATASET_DIR") or root
@@ -1008,8 +970,8 @@ def main():
     p.add_argument("--dataset-root", type=str, default="./data",
                    help="Root path for dataset files. For random_uniklinikum set to the dataset folder (train/test subdirs). Can also set RANDOM_UNIKLINIKUM_DATASET_DIR.")
     p.add_argument("--image-size", type=int, nargs=2, default=[28, 28])
-    p.add_argument("--batch-size", type=int, default=800)
-    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--weight-decay", type=float, default=0.00005,
                    help="AdamW weight decay applied to CNN parameters.")
@@ -1026,19 +988,19 @@ def main():
 
     # Optional confusion-matrix saving
     p.add_argument("--save-cm", action="store_true", help="Save confusion-matrix image after evaluation.")
-    p.add_argument("--cm-dir", type=str, default="cm", help="Directory to save confusion matrices.")
+    p.add_argument("--cm-dir", type=str, default="/home/erensr/ERTECnet/output_pcam/cm_pcam", help="Directory to save confusion matrices.")
     p.add_argument("--cm-every", type=int, default=1, help="Save a CM every N epochs (default 1).")
     # Optional ROC saving
     p.add_argument("--compute-roc-auc", action="store_true",
                    help="Compute ROC AUC during eval (collects probabilities; uses more memory). "
                         "Automatically enabled when --save-roc is used.")
     p.add_argument("--save-roc", action="store_true", help="Save ROC curve image after evaluation.")
-    p.add_argument("--roc-dir", type=str, default="roc", help="Directory to save ROC curves.")
+    p.add_argument("--roc-dir", type=str, default="/home/erensr/ERTECnet/output_pcam/roc_pcam", help="Directory to save ROC curves.")
     p.add_argument("--roc-every", type=int, default=1, help="Save a ROC curve every N epochs (default 1).")
     # Optional metrics logging
-    p.add_argument("--metrics-path", type=str, default="",
+    p.add_argument("--metrics-path", type=str, default="/home/erensr/ERTECnet/output_pcam/pcam_output.csv",
                    help="CSV file to append per-epoch metrics. Use empty string to disable.")
-    p.add_argument("--save-best-path", type=str, default="",
+    p.add_argument("--save-best-path", type=str, default="/home/erensr/ERTECnet/output_pcam/model_pcam.pt",
                    help="Path to save best-performing checkpoint (by test accuracy). Only saves if provided.")
 
     args = p.parse_args()
